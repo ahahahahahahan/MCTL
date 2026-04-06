@@ -15,3 +15,4 @@ from .prompt_config import (
 )
 from .prompt_config import MPRE_PROMPT_EN, MPRE_PROMPT_ZH
 from .prompt_config import CBDF_PROMPT_EN, CBDF_PROMPT_ZH
+from .prompt_config import DATASET_PROMPT_PATCH

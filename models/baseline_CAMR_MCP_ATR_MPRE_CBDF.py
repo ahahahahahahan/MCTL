@@ -26,6 +26,7 @@ from config import (
     MCP_PLANNING_PROMPT_EN, MCP_PLANNING_PROMPT_ZH,
     MPRE_PROMPT_EN, MPRE_PROMPT_ZH,
     CBDF_PROMPT_EN, CBDF_PROMPT_ZH,
+    DATASET_PROMPT_PATCH,
 )
 from models.baseline_CAMR import CAMRRetriever
 from models.baseline_CAMR_MCP import parse_planning_output, get_dag_execution_order
@@ -437,7 +438,8 @@ class MCTLDetector:
                            retrieved_context: str,
                            prev_results: Dict[str, Dict],
                            tool_dag: List[Dict],
-                           is_zh: bool) -> str:
+                           is_zh: bool,
+                           dataset_type: str = "") -> str:
         tool_def = TOOL_DEFINITIONS.get(tool_name, TOOL_DEFINITIONS["semantic_dissector"])
 
         # [改进2] 使用 v2 模板替代原始模板
@@ -481,17 +483,20 @@ class MCTLDetector:
         if not dep_context:
             dep_context = "（无前序工具依赖）" if is_zh else "(No prerequisite tool dependencies)"
 
-        return template.format(
+        base_prompt = template.format(
             tool_name=t_name, tool_desc=t_desc,
             retrieved_context=retrieved_context,
             dependency_context=dep_context, text=text,
         )
+        # 追加数据集专用补丁
+        ds_patch_tool = DATASET_PROMPT_PATCH.get(dataset_type, {})
+        return base_prompt + ds_patch_tool.get("tool_prompt", "")
 
     # ============================================================
     # [改进5] MPRE prompt 追加领域校准指令
     # ============================================================
     def _build_mpre_prompt(self, text, context_str, evidence_str, num_tools,
-                           weighted_vote, is_zh):
+                           weighted_vote, is_zh, dataset_type=""):
         template = MPRE_PROMPT_ZH if is_zh else MPRE_PROMPT_EN
         if is_zh:
             vote_signal = (
@@ -517,7 +522,9 @@ class MCTLDetector:
             calibration = MPRE_CALIBRATION_EN
         base = template.format(text=text, retrieved_context=context_str,
                                tool_evidence=evidence_str, num_tools=num_tools)
-        return base + "\n" + vote_signal + "\n" + calibration
+        # 追加数据集专用补丁
+        ds_patch_mpre = DATASET_PROMPT_PATCH.get(dataset_type, {})
+        return base + "\n" + vote_signal + "\n" + calibration + ds_patch_mpre.get("mpre", "")
 
     async def run_dataset(self, dataset_type: str, retriever: CAMRRetriever) -> Dict[str, Any]:
         config = DATASET_CONFIGS[dataset_type]
@@ -574,6 +581,9 @@ class MCTLDetector:
         planning_template = MCP_PLANNING_PROMPT_V2_ZH if is_zh else MCP_PLANNING_PROMPT_V2_EN
         cbdf_template = CBDF_PROMPT_ZH if is_zh else CBDF_PROMPT_EN
 
+        # 数据集专用 prompt 补丁
+        ds_patch = DATASET_PROMPT_PATCH.get(dataset_type, {})
+
         async def process_item(session, idx, text, image_filename, label, retrieved):
             if idx in processed_indices:
                 return None
@@ -594,7 +604,7 @@ class MCTLDetector:
             label_prior = label_dist["fake"] / max(sum(label_dist.values()), 1)
 
             # ---- MCP 规划（改进1: 领域感知） ----
-            planning_prompt = planning_template.format(text=text, retrieved_context=context_str)
+            planning_prompt = planning_template.format(text=text, retrieved_context=context_str) + ds_patch.get("mcp_planning", "")
             async with semaphore:
                 planning_response = await self._call_llm(session, planning_prompt, image_path)
             api_calls += 1
@@ -618,7 +628,8 @@ class MCTLDetector:
 
             for tool_name in tool_sequence:
                 tool_prompt = self._build_tool_prompt(
-                    tool_name, text, context_str, tool_results, tool_dag, is_zh
+                    tool_name, text, context_str, tool_results, tool_dag, is_zh,
+                    dataset_type=dataset_type
                 )
                 async with semaphore:
                     tool_response = await self._call_llm(session, tool_prompt, image_path)
@@ -633,7 +644,9 @@ class MCTLDetector:
                     "reasoning_snippet": parsed["reasoning_trace"][:200],
                 })
 
-                if (len(executed_tools) >= 2 and
+                # 中文数据集要求至少3个工具才允许短路（减少风格类工具偏差传播）
+                min_tools_for_sc = 3 if is_zh else 2
+                if (len(executed_tools) >= min_tools_for_sc and
                         parsed["confidence_score"] >= SHORT_CIRCUIT_THRESHOLD):
                     short_circuited = True
                     break
@@ -652,10 +665,16 @@ class MCTLDetector:
                     if p is not None:
                         high_conf_preds.append(p)
 
-            # [改进4] 保守 Bypass: 至少 3 个工具 + margin >= 0.6 + 检索先验对齐
-            if (len(high_conf_preds) >= BYPASS_MIN_TOOLS and
+            # [改进4] 保守 Bypass: 中文数据集要求更严格
+            FACTUAL_TOOLS = {"knowledge_grounding", "evidence_comparator", "cross_modal_aligner"}
+            has_factual = any(t["tool"] in FACTUAL_TOOLS for t in executed_tools
+                             if t["confidence"] >= CONFIDENCE_FILTER_THRESHOLD)
+            bypass_min = BYPASS_MIN_TOOLS + (1 if is_zh else 0)  # 中文至少4个工具
+            bypass_margin = 0.8 if is_zh else BYPASS_MARGIN_THRESHOLD  # 中文要求更高margin
+            if (len(high_conf_preds) >= bypass_min and
                     len(set(high_conf_preds)) == 1 and
-                    weighted_vote["margin"] >= BYPASS_MARGIN_THRESHOLD):
+                    weighted_vote["margin"] >= bypass_margin and
+                    (has_factual or not is_zh)):
                 # 额外检查：检索先验对齐
                 consensus_dir = "fake" if high_conf_preds[0] == 1 else "real"
                 retr_majority = "fake" if label_dist["fake"] > label_dist["real"] else "real"
@@ -674,7 +693,8 @@ class MCTLDetector:
                         tool_results, is_zh=is_zh, min_confidence=0.0
                     )
                 mpre_prompt = self._build_mpre_prompt(
-                    text, context_str, evidence_str, included, weighted_vote, is_zh
+                    text, context_str, evidence_str, included, weighted_vote, is_zh,
+                    dataset_type=dataset_type
                 )
                 async with semaphore:
                     mpre_response = await self._call_llm(session, mpre_prompt, image_path)
@@ -728,8 +748,8 @@ class MCTLDetector:
                     weighted_vote_majority=weighted_vote["majority"],
                     weighted_vote_margin=f"{weighted_vote['margin']:.1%}",
                 )
-                # [改进5] 追加基率感知指令
-                cbdf_prompt = cbdf_prompt + "\n" + base_rate_note
+                # [改进5] 追加基率感知指令 + 数据集专用补丁
+                cbdf_prompt = cbdf_prompt + "\n" + base_rate_note + ds_patch.get("cbdf", "")
 
                 async with semaphore:
                     cbdf_response = await self._call_llm(session, cbdf_prompt, image_path)
