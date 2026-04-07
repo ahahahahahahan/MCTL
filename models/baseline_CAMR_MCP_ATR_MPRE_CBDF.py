@@ -344,6 +344,33 @@ CBDF_BASE_RATE_ZH = '''
 - 仅凭写作风格（煽动性、标题党、情绪化语言）不足以推翻强"真实"基率——这些可能是该新闻领域的正常风格'''
 
 
+# ============================================================
+# [v4改进] 工具置信度校准 —— 中文社交媒体场景
+# 风格类工具(rhetorical_scanner, emotional_manipulator)在微博上
+# 判定fake的可靠性低, 降低其置信度; 事实类工具保持不变
+# ============================================================
+STYLE_TOOLS = {"rhetorical_scanner", "emotional_manipulator"}
+FACTUAL_TOOLS_SET = {"knowledge_grounding", "evidence_comparator", "cross_modal_aligner"}
+
+def calibrate_tool_confidence(tool_results: dict, is_zh: bool) -> dict:
+    """
+    对中文社交媒体数据集, 校准风格类工具的置信度。
+    仅当风格类工具判定 fake 时降低置信度（判 real 时不降）。
+    """
+    if not is_zh:
+        return tool_results
+
+    calibrated = {}
+    for name, result in tool_results.items():
+        r = dict(result)  # shallow copy
+        if name in STYLE_TOOLS:
+            pred = normalize_prediction(r["prediction"])
+            if pred == 1:  # 判定 fake 时降低置信度
+                r["confidence_score"] = r["confidence_score"] * 0.5
+        calibrated[name] = r
+    return calibrated
+
+
 def compute_uncertainty(tool_results_list: List[Dict]) -> Dict[str, Any]:
     """
     计算工具间不确定性指标。
@@ -651,6 +678,9 @@ class MCTLDetector:
                     short_circuited = True
                     break
 
+            # ---- v4改进: 工具置信度校准 ----
+            tool_results = calibrate_tool_confidence(tool_results, is_zh)
+
             # ---- 改进3: 动态工具可靠性估计 ----
             dynamic_weights = compute_dynamic_tool_weights(tool_results, label_dist)
 
@@ -703,7 +733,7 @@ class MCTLDetector:
                 mpre_answer = extract_answer(mpre_response)
                 mpre_prediction = normalize_prediction(mpre_answer)
 
-            # ---- CBDF: 不确定性感知决策融合 ----
+            # ---- CBDF: 不确定性感知决策融合 (v4: 增加硬规则层) ----
             uncertainty = compute_uncertainty(executed_tools)
             cbdf_bypass = False
             needs_review = False
@@ -711,14 +741,38 @@ class MCTLDetector:
             retrieval_majority = "fake" if label_dist["fake"] > label_dist["real"] else "real"
             mpre_direction = "fake" if mpre_prediction == 1 else "real" if mpre_prediction == 0 else "unknown"
 
-            if (consensus_bypass and
+            # [v4] 硬规则层: 工具投票方向 + 检索先验一致 → 直接决策, 不送 LLM
+            # 这避免了 LLM 在 CBDF 阶段"想太多"翻转正确结果
+            vote_direction = weighted_vote["majority"]
+            hard_rule_applied = False
+            if (is_zh and
+                    weighted_vote["margin"] >= 0.5 and
+                    vote_direction == retrieval_majority and
+                    vote_direction in ("fake", "real")):
+                hard_rule_applied = True
+                cbdf_bypass = True
+                predict = 1 if vote_direction == "fake" else 0
+                answer = vote_direction
+                cbdf_response = f"[v4 hard rule] vote={vote_direction} + retrieval={retrieval_majority} aligned, margin={weighted_vote['margin']:.2f}"
+            # [v4] 工具+MPRE一致且margin高 → 直接决策
+            elif (is_zh and
+                    weighted_vote["margin"] >= 0.6 and
+                    vote_direction == mpre_direction and
+                    vote_direction in ("fake", "real")):
+                hard_rule_applied = True
+                cbdf_bypass = True
+                predict = 1 if vote_direction == "fake" else 0
+                answer = vote_direction
+                cbdf_response = f"[v4 hard rule] vote={vote_direction} + mpre={mpre_direction} aligned, margin={weighted_vote['margin']:.2f}"
+
+            if not hard_rule_applied and (consensus_bypass and
                     weighted_vote["margin"] >= BYPASS_MARGIN_THRESHOLD and
                     (retrieval_majority == mpre_direction or label_dist["fake"] == label_dist["real"])):
                 cbdf_bypass = True
                 predict = mpre_prediction
                 answer = "fake" if predict == 1 else "real"
                 cbdf_response = f"[CBDF bypass] Consensus + retrieval prior aligned: {answer}"
-            else:
+            elif not hard_rule_applied:
                 if is_zh:
                     label_dist_str = (f"检索到的 {self.top_k} 个相似样本中，"
                                       f"{label_dist['fake']} 个为虚假，{label_dist['real']} 个为真实 "
