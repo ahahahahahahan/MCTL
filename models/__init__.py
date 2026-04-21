@@ -2,6 +2,7 @@
 模型模块
 """
 from .baseline import BaselineDetector
+from .baseline_COT import BaselineCOTDetector
 from .baseline_CAMR import BaselineCAMRDetector
 from .baseline_CAMR_MCP import BaselineCAMRMCPDetector
 from .baseline_CAMR_MCP_ATR import BaselineCAMRMCPATRDetector

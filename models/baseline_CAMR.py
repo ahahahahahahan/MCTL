@@ -8,6 +8,7 @@ import aiohttp
 import time
 import json
 import os
+import hashlib
 import numpy as np
 import torch
 import clip
@@ -20,20 +21,19 @@ from config import (
     TEMPERATURE, MAX_TOKENS,
     BATCH_SIZE, MAX_CONCURRENCY, BATCH_DELAY, REQUEST_DELAY,
     DATASET_CONFIGS, API_TIMEOUT,
-    CAMR_PROMPT_EN, CAMR_PROMPT_ZH,
+    CAMR_PROMPT_EN,
 )
 from utils import preprocess_data, fetch_api, extract_answer, normalize_prediction, calculate_metrics
-
-ZH_DATASETS = {"weibo", "weibo21"}
 
 
 class CAMRRetriever:
     """CAMR: 基于 CLIP 嵌入的上下文增强多模态检索模块"""
 
-    def __init__(self, clip_model: str = "ViT-B/32", device: str = None, top_k: int = 5):
+    def __init__(self, clip_model: str = "ViT-B/32", device: str = None, top_k: int = 5, text_weight: float = 0.6):
         self.top_k = top_k
+        self.text_weight = text_weight
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"[CAMR] 加载 CLIP 模型 {clip_model} on {self.device} ...")
+        print(f"[CAMR] 加载 CLIP 模型 {clip_model} on {self.device}, text_weight={text_weight} ...")
         self.model, self.preprocess = clip.load(clip_model, device=self.device)
         self.model.eval()
 
@@ -42,10 +42,14 @@ class CAMRRetriever:
         self.train_data: List[Dict] = []
 
     @torch.no_grad()
-    def _encode_text(self, texts: List[str], batch_size: int = 64) -> np.ndarray:
+    def _encode_text(self, texts: List[str], batch_size: int = 64, show_progress: bool = False) -> np.ndarray:
         """编码文本为 CLIP 嵌入"""
         all_features = []
-        for i in range(0, len(texts), batch_size):
+        batches = range(0, len(texts), batch_size)
+        if show_progress:
+            batches = tqdm(batches, desc="编码文本", unit="batch",
+                           total=(len(texts) + batch_size - 1) // batch_size)
+        for i in batches:
             batch = texts[i:i + batch_size]
             tokens = clip.tokenize(batch, truncate=True).to(self.device)
             features = self.model.encode_text(tokens)
@@ -54,22 +58,42 @@ class CAMRRetriever:
         return np.vstack(all_features).astype("float32")
 
     @torch.no_grad()
-    def _encode_image(self, image_paths: List[str], batch_size: int = 32) -> np.ndarray:
+    def _encode_image(self, image_paths: List[str], batch_size: int = 32, show_progress: bool = False) -> np.ndarray:
         """编码图像为 CLIP 嵌入，图片不存在则返回零向量"""
+        from concurrent.futures import ThreadPoolExecutor
         dim = self.model.visual.output_dim
         all_features = []
-        for i in range(0, len(image_paths), batch_size):
+        batches = range(0, len(image_paths), batch_size)
+        if show_progress:
+            batches = tqdm(batches, desc="编码图片", unit="batch",
+                           total=(len(image_paths) + batch_size - 1) // batch_size)
+
+        preprocess = self.preprocess
+
+        def _load_one(path):
+            if path and os.path.exists(path):
+                try:
+                    img = Image.open(path).convert("RGB")
+                    return preprocess(img)
+                except Exception:
+                    return None
+            return None
+
+        num_workers = min(8, os.cpu_count() or 4)
+
+        for i in batches:
             batch_paths = image_paths[i:i + batch_size]
+
+            # 多线程并行加载 + 预处理
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                results = list(pool.map(_load_one, batch_paths))
+
             batch_tensors = []
             valid_indices = []
-            for j, path in enumerate(batch_paths):
-                if path and os.path.exists(path):
-                    try:
-                        img = Image.open(path).convert("RGB")
-                        batch_tensors.append(self.preprocess(img))
-                        valid_indices.append(j)
-                    except Exception:
-                        pass
+            for j, tensor in enumerate(results):
+                if tensor is not None:
+                    batch_tensors.append(tensor)
+                    valid_indices.append(j)
 
             batch_features = np.zeros((len(batch_paths), dim), dtype="float32")
             if batch_tensors:
@@ -97,10 +121,40 @@ class CAMRRetriever:
 
         return fused
 
+    def _get_cache_dir(self, train_path: str) -> str:
+        """根据训练路径和模型参数生成缓存目录"""
+        # 用训练文件路径 + text_weight 生成唯一 key
+        key_str = f"{os.path.abspath(train_path)}|tw={self.text_weight}"
+        key_hash = hashlib.md5(key_str.encode()).hexdigest()[:12]
+        # 从训练路径提取数据集名（如 weibo）
+        dataset_name = os.path.basename(os.path.dirname(train_path))
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                 "cache", f"camr_{dataset_name}_{key_hash}")
+        return cache_dir
+
     def build_index(self, train_path: str, images_dir: str):
-        """从训练集构建 FAISS 索引"""
+        """从训练集构建 FAISS 索引（带磁盘缓存）"""
         from utils import preprocess_data as prep
 
+        cache_dir = self._get_cache_dir(train_path)
+        cache_files = {
+            "text_emb": os.path.join(cache_dir, "text_emb.npy"),
+            "image_emb": os.path.join(cache_dir, "image_emb.npy"),
+            "fused_emb": os.path.join(cache_dir, "fused_emb.npy"),
+            "train_data": os.path.join(cache_dir, "train_data.json"),
+            "index": os.path.join(cache_dir, "index.faiss"),
+        }
+
+        # 尝试加载缓存
+        if all(os.path.exists(f) for f in cache_files.values()):
+            print(f"[CAMR] 发现缓存，从 {cache_dir} 加载 ...")
+            self.train_data = json.load(open(cache_files["train_data"], "r", encoding="utf-8"))
+            fused_emb = np.load(cache_files["fused_emb"])
+            self.index = faiss.read_index(cache_files["index"])
+            print(f"[CAMR] 缓存加载完成, 维度={fused_emb.shape[1]}, 样本数={self.index.ntotal}")
+            return
+
+        # 无缓存，重新编码
         print("[CAMR] 加载训练数据 ...")
         train_df = prep(train_path)
         texts = train_df["text"].tolist()
@@ -124,16 +178,26 @@ class CAMRRetriever:
             })
 
         print(f"[CAMR] 编码 {len(texts)} 条训练文本 ...")
-        text_emb = self._encode_text(texts)
+        text_emb = self._encode_text(texts, show_progress=True)
         print(f"[CAMR] 编码 {len(image_paths)} 张训练图片 ...")
-        image_emb = self._encode_image(image_paths)
+        image_emb = self._encode_image(image_paths, show_progress=True)
 
-        fused_emb = self._fuse_embeddings(text_emb, image_emb)
+        fused_emb = self._fuse_embeddings(text_emb, image_emb, text_weight=self.text_weight)
 
         dim = fused_emb.shape[1]
         self.index = faiss.IndexFlatIP(dim)
         self.index.add(fused_emb)
         print(f"[CAMR] FAISS 索引构建完成, 维度={dim}, 样本数={self.index.ntotal}")
+
+        # 保存缓存
+        os.makedirs(cache_dir, exist_ok=True)
+        np.save(cache_files["text_emb"], text_emb)
+        np.save(cache_files["image_emb"], image_emb)
+        np.save(cache_files["fused_emb"], fused_emb)
+        faiss.write_index(self.index, cache_files["index"])
+        with open(cache_files["train_data"], "w", encoding="utf-8") as f:
+            json.dump(self.train_data, f, ensure_ascii=False)
+        print(f"[CAMR] 缓存已保存至 {cache_dir}")
 
     def retrieve(self, text: str, image_path: Optional[str] = None,
                  top_k: int = None) -> List[Dict]:
@@ -144,7 +208,7 @@ class CAMRRetriever:
 
         text_emb = self._encode_text([text])
         image_emb = self._encode_image([image_path])
-        query_emb = self._fuse_embeddings(text_emb, image_emb)
+        query_emb = self._fuse_embeddings(text_emb, image_emb, text_weight=self.text_weight)
 
         scores, indices = self.index.search(query_emb, k)
         results = []
@@ -156,11 +220,9 @@ class CAMRRetriever:
             results.append(item)
         return results
 
-    def format_context(self, retrieved: List[Dict], is_zh: bool = False) -> str:
-        """将检索结果格式化为 prompt 上下文字符串"""
+    def format_context(self, retrieved: List[Dict]) -> str:
+        """Format retrieved results as prompt context string"""
         if not retrieved:
-            if is_zh:
-                return "（未检索到相似样本）"
             return "(No similar articles retrieved)"
 
         lines = []
@@ -168,17 +230,10 @@ class CAMRRetriever:
             label = item["label_str"]
             sim = item["similarity"]
             text_snippet = item["text"][:300]
-            if is_zh:
-                label_display = "虚假" if label == "fake" else "真实"
-                lines.append(
-                    f"[相似样本 {i}] (相似度: {sim:.3f}, 标签: {label_display})\n"
-                    f"内容摘要: {text_snippet}..."
-                )
-            else:
-                lines.append(
-                    f"[Similar Article {i}] (Similarity: {sim:.3f}, Label: {label})\n"
-                    f"Content summary: {text_snippet}..."
-                )
+            lines.append(
+                f"[Similar Article {i}] (Similarity: {sim:.3f}, Label: {label})\n"
+                f"Content summary: {text_snippet}..."
+            )
         return "\n\n".join(lines)
 
 
@@ -196,8 +251,6 @@ class BaselineCAMRDetector:
         self.clip_model = clip_model
 
     def _get_prompt_template(self, dataset_type: str) -> str:
-        if dataset_type in ZH_DATASETS:
-            return CAMR_PROMPT_ZH
         return CAMR_PROMPT_EN
 
     def _build_prompt(self, text: str, retrieved_context: str, dataset_type: str) -> str:
@@ -230,7 +283,6 @@ class BaselineCAMRDetector:
         config = DATASET_CONFIGS[dataset_type]
         self.batch_size = config.get("batch_size", BATCH_SIZE)
         self.max_concurrency = config.get("max_concurrency", MAX_CONCURRENCY)
-        is_zh = dataset_type in ZH_DATASETS
 
         print(f"\n{'='*60}")
         print(f"Exp1: Baseline + CAMR (K={self.top_k}) — 数据集: {dataset_type}")
@@ -287,7 +339,7 @@ class BaselineCAMRDetector:
             if idx in processed_indices:
                 return None
 
-            context_str = retriever.format_context(retrieved, is_zh=is_zh)
+            context_str = retriever.format_context(retrieved)
             prompt = self._build_prompt(text, context_str, dataset_type)
 
             image_path = None

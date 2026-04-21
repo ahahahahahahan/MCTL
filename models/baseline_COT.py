@@ -1,29 +1,59 @@
 """
-Exp0: Baseline — Direct LLM Prompting
-纯 LLM 零样本判断，不使用任何模块
-Pipeline: Input -> LLM Direct Prediction -> Output
+Exp0-COT: Baseline + Chain-of-Thought Prompting
+在纯 LLM 零样本基础上，加入 COT 思维链引导逐步推理
+Pipeline: Input -> LLM Chain-of-Thought Reasoning -> Output
 """
 import asyncio
 import aiohttp
 import time
 import json
 import os
-import pandas as pd
 from typing import List, Dict, Any
 from tqdm import tqdm
-from sklearn.metrics import f1_score
 
 from config import (
     TEMPERATURE, MAX_TOKENS,
     BATCH_SIZE, MAX_CONCURRENCY, BATCH_DELAY, REQUEST_DELAY,
     DATASET_CONFIGS, API_TIMEOUT,
-    BASELINE_PROMPT_EN,
 )
 from utils import preprocess_data, fetch_api, extract_answer, normalize_prediction, calculate_metrics
 
 
-class BaselineDetector:
-    """Exp0: 直接 LLM 推理 Baseline"""
+# ============================================================
+# COT Prompt: 引导 LLM 分步骤推理后再给出判断
+# 与 Baseline 的区别：Baseline 只要求 "Thinking + Answer"，
+# COT 显式拆解为 5 个推理步骤，迫使模型逐步分析后再下结论
+# ============================================================
+
+BASELINE_COT_PROMPT_EN = '''You are a professional fake news detector. Determine whether the following news is real or fake by reasoning step-by-step.
+
+News text:
+"{text}"
+
+Please analyze this news using the following Chain-of-Thought reasoning steps:
+
+Step 1 — Claim Identification: What are the core factual claims made in this news? List the key assertions.
+
+Step 2 — Language & Tone Analysis: Is the language neutral and objective, or does it use sensationalist, emotionally manipulative, or exaggerated expressions?
+
+Step 3 — Logical Consistency: Are there any internal contradictions, logical fallacies, or unsupported leaps in reasoning?
+
+Step 4 — Source & Evidence: Does the news cite credible sources? Are the claims supported by verifiable evidence? Are there missing attributions?
+
+Step 5 — Overall Assessment: Synthesize your findings from Steps 1-4. What is the overall pattern — does the evidence point toward real or fake?
+
+Your output must strictly follow this format:
+"Step 1 — Claim Identification: [Your analysis]
+Step 2 — Language & Tone: [Your analysis]
+Step 3 — Logical Consistency: [Your analysis]
+Step 4 — Source & Evidence: [Your analysis]
+Step 5 — Overall Assessment: [Your synthesis]
+Thinking: [Your final reasoning based on the above steps]
+Answer: [real/fake]."'''
+
+
+class BaselineCOTDetector:
+    """Exp0-COT: 基线 + Chain-of-Thought 思维链推理"""
 
     def __init__(self):
         self.temperature = TEMPERATURE
@@ -33,17 +63,13 @@ class BaselineDetector:
         self.max_concurrency = MAX_CONCURRENCY
         self.request_delay = REQUEST_DELAY
 
-    def _get_prompt_template(self, dataset_type: str) -> str:
-        return BASELINE_PROMPT_EN
-
     def _build_prompt(self, text: str, dataset_type: str) -> str:
-        template = self._get_prompt_template(dataset_type)
-        return template.format(text=text)
+        return BASELINE_COT_PROMPT_EN.format(text=text)
 
     def _get_result_path(self, dataset_type: str) -> str:
         results_dir = DATASET_CONFIGS[dataset_type]["results_dir"]
         os.makedirs(results_dir, exist_ok=True)
-        return os.path.join(results_dir, "exp0_baseline.jsonl")
+        return os.path.join(results_dir, "exp0_baseline_cot.jsonl")
 
     def _load_existing_results(self, result_path: str) -> List[Dict]:
         if not os.path.exists(result_path):
@@ -55,7 +81,6 @@ class BaselineDetector:
                 if line:
                     try:
                         item = json.loads(line)
-                        # 跳过最终统计行
                         if 'index' in item:
                             results.append(item)
                     except json.JSONDecodeError:
@@ -63,13 +88,13 @@ class BaselineDetector:
         return results
 
     async def run_dataset(self, dataset_type: str) -> Dict[str, Any]:
-        """对单个数据集运行 Exp0 Baseline"""
+        """对单个数据集运行 Exp0-COT"""
         config = DATASET_CONFIGS[dataset_type]
         self.batch_size = config.get("batch_size", BATCH_SIZE)
         self.max_concurrency = config.get("max_concurrency", MAX_CONCURRENCY)
 
         print(f"\n{'='*60}")
-        print(f"Exp0 Baseline — 数据集: {dataset_type}")
+        print(f"Exp0-COT Baseline+COT — 数据集: {dataset_type}")
         print(f"{'='*60}")
 
         start_time = time.time()
@@ -96,7 +121,6 @@ class BaselineDetector:
         semaphore = asyncio.Semaphore(self.max_concurrency)
         all_results = list(existing_results)
 
-        # 统计已有结果
         all_true = []
         all_pred = []
         for r in existing_results:
@@ -137,20 +161,18 @@ class BaselineDetector:
                 'label': label,
                 'predict': predict,
                 'answer_raw': answer,
-                'response': response[:500],
+                'response': response[:1000],
             }
 
         try:
             async with aiohttp.ClientSession() as session:
-                # 准备待处理项
                 items = [
                     (i, test_texts[i], test_images[i] if i < len(test_images) else None, true_labels[i])
                     for i in range(len(test_texts))
                     if i not in processed_indices
                 ]
 
-                with tqdm(total=len(items), desc=f"Exp0[{dataset_type}]", unit="样本") as pbar:
-                    # 分批处理
+                with tqdm(total=len(items), desc=f"Exp0-COT[{dataset_type}]", unit="样本") as pbar:
                     for batch_start in range(0, len(items), self.batch_size):
                         batch = items[batch_start:batch_start + self.batch_size]
                         tasks = [
@@ -173,15 +195,12 @@ class BaselineDetector:
 
                         pbar.update(len(batch))
 
-                        # 实时显示准确率
                         if all_true:
                             acc = sum(t == p for t, p in zip(all_true, all_pred)) / len(all_true)
                             pbar.set_postfix({"acc": f"{acc:.2%}", "有效": len(all_true)})
 
-                        # 批次间延迟
                         await asyncio.sleep(BATCH_DELAY)
         finally:
-            # 写入最终统计
             if all_true:
                 metrics = calculate_metrics(all_true, all_pred)
                 summary = {
@@ -199,7 +218,7 @@ class BaselineDetector:
         total_time = time.time() - start_time
         metrics = calculate_metrics(all_true, all_pred) if all_true else {}
 
-        print(f"\n--- Exp0 Baseline 结果 [{dataset_type}] ---")
+        print(f"\n--- Exp0-COT Baseline+COT 结果 [{dataset_type}] ---")
         print(f"总样本: {len(test_texts)}, 有效预测: {len(all_true)}")
         print(f"Accuracy:  {metrics.get('accuracy', 0):.4f}")
         print(f"Precision: {metrics.get('precision', 0):.4f}")
@@ -220,7 +239,7 @@ class BaselineDetector:
 
     def run(self, dataset_type: str = None) -> Dict[str, Any]:
         """
-        运行 Exp0 Baseline
+        运行 Exp0-COT
 
         Args:
             dataset_type: 指定数据集，为 None 则运行所有数据集
@@ -236,10 +255,9 @@ class BaselineDetector:
             result = asyncio.run(self.run_dataset(ds))
             results[ds] = result
 
-        # 汇总输出
         if len(results) > 1:
             print(f"\n{'='*60}")
-            print("Exp0 Baseline 汇总结果")
+            print("Exp0-COT Baseline+COT 汇总结果")
             print(f"{'='*60}")
             print(f"{'数据集':<12} {'Accuracy':>10} {'Macro-F1':>10} {'Precision':>10} {'Recall':>10} {'F1':>10}")
             print("-" * 64)

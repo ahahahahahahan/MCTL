@@ -1,17 +1,19 @@
 """
-MCTL 实验主程序
-用法:
+MCTL Experiment Main Entry
+Usage:
     python main.py --exp exp0                   # Exp0: Baseline
+    python main.py --exp exp0_cot               # Exp0-COT: Baseline + Chain-of-Thought
     python main.py --exp exp1                   # Exp1: +CAMR
     python main.py --exp exp2                   # Exp2: +CAMR+MCP
     python main.py --exp exp3                   # Exp3: +CAMR+MCP+ATR
     python main.py --exp exp4                   # Exp4: +CAMR+MCP+ATR+MPRE
     python main.py --exp exp5                   # Exp5: Full MCTL (+CBDF)
-    python main.py --dataset polifact --exp exp5
+    python main.py --dataset xfacta --exp exp0
 """
 import argparse
 from models import (
     BaselineDetector,
+    BaselineCOTDetector,
     BaselineCAMRDetector,
     BaselineCAMRMCPDetector,
     BaselineCAMRMCPATRDetector,
@@ -21,17 +23,20 @@ from models import (
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MCTL 实验")
+    parser = argparse.ArgumentParser(description="MCTL Experiment")
     parser.add_argument("--dataset", type=str, default=None,
-                        choices=["polifact", "gossip", "weibo21", "weibo"])
+                        choices=["polifact", "gossip", "weibo21", "weibo", "xfacta"])
     parser.add_argument("--exp", type=str, default="exp0",
-                        choices=["exp0", "exp1", "exp2", "exp3", "exp4", "exp5"])
+                        choices=["exp0", "exp0_cot", "exp1", "exp2", "exp3", "exp4", "exp5"])
     parser.add_argument("--top_k", type=int, default=5)
     parser.add_argument("--clip_model", type=str, default="ViT-B/32")
+    parser.add_argument("--text_weight", type=float, default=0.6,
+                        help="Text embedding weight (0.8 recommended for Weibo)")
     args = parser.parse_args()
 
     detectors = {
         "exp0": lambda: BaselineDetector(),
+        "exp0_cot": lambda: BaselineCOTDetector(),
         "exp1": lambda: BaselineCAMRDetector(top_k=args.top_k, clip_model=args.clip_model),
         "exp2": lambda: BaselineCAMRMCPDetector(top_k=args.top_k, clip_model=args.clip_model),
         "exp3": lambda: BaselineCAMRMCPATRDetector(top_k=args.top_k, clip_model=args.clip_model),

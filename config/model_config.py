@@ -1,9 +1,9 @@
 """
-模型参数配置
+Model parameter configuration
 """
 TEMPERATURE = 0.3
 MAX_TOKENS = 2048
-BATCH_SIZE = 10  # 之前是30
-MAX_CONCURRENCY = 5 # 之前是15
-BATCH_DELAY = 3 # 之前是2
-REQUEST_DELAY = 2 # 之前是1
+BATCH_SIZE = 30
+MAX_CONCURRENCY = 10
+BATCH_DELAY = 0.5
+REQUEST_DELAY = 0.2

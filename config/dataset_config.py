@@ -1,9 +1,7 @@
 """
-数据集配置 - 数据复用 fakenews 项目
+Dataset configuration - reusing data from fakenews project
 """
 DATA_ROOT = "/home/liangjun/Desktop/HY/code/fakenews/data"
-
-EXPERIMENT_DATASET_TYPE = "gossip"
 
 DATASET_CONFIGS = {
     "polifact": {
@@ -37,5 +35,13 @@ DATASET_CONFIGS = {
         "batch_size": 30,
         "max_concurrency": 15,
         "results_dir": "results/weibo",
+    },
+    "xfacta": {
+        "test_path": f"{DATA_ROOT}/xfacta/test.jsonl",
+        "train_path": f"{DATA_ROOT}/xfacta/train.jsonl",
+        "images_dir": f"{DATA_ROOT}/xfacta/images",
+        "batch_size": 30,
+        "max_concurrency": 15,
+        "results_dir": "results/xfacta",
     },
 }

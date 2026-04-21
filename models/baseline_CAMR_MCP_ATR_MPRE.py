@@ -1,13 +1,13 @@
 """
-Exp4: + MPRE（Multi-Perspective Reasoning Ensemble）
-在 Exp3 (ATR) 基础上加入多视角推理集成
-不再取最后工具输出，而是 LLM 综合所有工具推理轨迹做融合判断
-Pipeline: Input -> CAMR -> MCP -> ATR工具执行 -> MPRE证据融合 -> Output
+Exp4: + MPRE (Multi-Perspective Reasoning Ensemble)
+Built on Exp3 (ATR), adds multi-perspective reasoning ensemble.
+Instead of using the last tool output, LLM synthesizes all tool reasoning traces for fused judgment.
+Pipeline: Input -> CAMR -> MCP -> ATR tool execution -> MPRE evidence fusion -> Output
 
-调优策略：
-  1. 过滤低置信度工具（<0.5）的证据，避免噪声干扰 MPRE
-  2. 在 MPRE prompt 中注入置信度加权多数票信号，锚定融合方向
-  3. 恢复适度短路（阈值 0.95），极高置信度时提前结束避免后续工具引入噪声
+Tuning strategy:
+  1. Filter low-confidence tool evidence (<0.5) to avoid noise interfering with MPRE
+  2. Inject confidence-weighted majority vote signal into MPRE prompt to anchor fusion direction
+  3. Restore moderate short-circuit (threshold 0.95), early termination at very high confidence to avoid noise from subsequent tools
 """
 import asyncio
 import aiohttp
@@ -22,30 +22,28 @@ from config import (
     TEMPERATURE, MAX_TOKENS,
     BATCH_SIZE, MAX_CONCURRENCY, BATCH_DELAY, REQUEST_DELAY,
     DATASET_CONFIGS, API_TIMEOUT,
-    MCP_PLANNING_PROMPT_EN, MCP_PLANNING_PROMPT_ZH,
-    MPRE_PROMPT_EN, MPRE_PROMPT_ZH,
+    MCP_PLANNING_PROMPT_EN,
+    MPRE_PROMPT_EN,
 )
 from models.baseline_CAMR import CAMRRetriever
 from models.baseline_CAMR_MCP import parse_planning_output, get_dag_execution_order
 from models.baseline_CAMR_MCP_ATR import (
     TOOL_DEFINITIONS, DIMENSION_TO_TOOL,
-    TOOL_PROMPT_EN, TOOL_PROMPT_ZH,
+    TOOL_PROMPT_EN,
     parse_tool_output,
 )
 from utils import preprocess_data, fetch_api, extract_answer, normalize_prediction, calculate_metrics
 
-ZH_DATASETS = {"weibo", "weibo21"}
-
-# 调优参数
-CONFIDENCE_FILTER_THRESHOLD = 0.5   # 过滤低置信度工具证据
-SHORT_CIRCUIT_THRESHOLD = 0.95      # 适度短路阈值
+# Tuning parameters
+CONFIDENCE_FILTER_THRESHOLD = 0.5   # Filter low-confidence tool evidence
+SHORT_CIRCUIT_THRESHOLD = 0.95      # Moderate short-circuit threshold
 
 
-def format_tool_evidence_filtered(tool_results: Dict[str, Dict], is_zh: bool,
+def format_tool_evidence_filtered(tool_results: Dict[str, Dict],
                                   min_confidence: float = CONFIDENCE_FILTER_THRESHOLD) -> tuple:
     """
-    将工具结果格式化为 MPRE 证据字符串，过滤低置信度工具。
-    返回: (evidence_str, included_count, filtered_count)
+    Format tool results as MPRE evidence string, filtering low-confidence tools.
+    Returns: (evidence_str, included_count, filtered_count)
     """
     lines = []
     filtered = 0
@@ -54,30 +52,21 @@ def format_tool_evidence_filtered(tool_results: Dict[str, Dict], is_zh: bool,
             filtered += 1
             continue
         tool_def = TOOL_DEFINITIONS.get(tool_name, {})
-        if is_zh:
-            display_name = tool_def.get("name_zh", tool_name)
-            lines.append(
-                f"[工具 {i}: {display_name}]\n"
-                f"分析：{result['reasoning_trace'][:400]}\n"
-                f"置信度：{result['confidence_score']:.2f}\n"
-                f"判断：{result['prediction']}"
-            )
-        else:
-            display_name = tool_def.get("name_en", tool_name)
-            lines.append(
-                f"[Tool {i}: {display_name}]\n"
-                f"Analysis: {result['reasoning_trace'][:400]}\n"
-                f"Confidence: {result['confidence_score']:.2f}\n"
-                f"Judgment: {result['prediction']}"
-            )
+        display_name = tool_def.get("name_en", tool_name)
+        lines.append(
+            f"[Tool {i}: {display_name}]\n"
+            f"Analysis: {result['reasoning_trace'][:400]}\n"
+            f"Confidence: {result['confidence_score']:.2f}\n"
+            f"Judgment: {result['prediction']}"
+        )
     return "\n\n".join(lines), len(lines), filtered
 
 
 def compute_weighted_vote(tool_results: Dict[str, Dict],
                           min_confidence: float = CONFIDENCE_FILTER_THRESHOLD) -> dict:
     """
-    计算置信度加权投票。
-    返回: {fake_score, real_score, majority, margin}
+    Compute confidence-weighted voting.
+    Returns: {fake_score, real_score, majority, margin}
     """
     fake_score = 0.0
     real_score = 0.0
@@ -106,7 +95,7 @@ def compute_weighted_vote(tool_results: Dict[str, Dict],
 
 
 class BaselineCAMRMCPATRMPREDetector:
-    """Exp4: Baseline + CAMR + MCP + ATR + MPRE 检测器"""
+    """Exp4: Baseline + CAMR + MCP + ATR + MPRE Detector"""
 
     def __init__(self, top_k: int = 5, clip_model: str = "ViT-B/32"):
         self.temperature = TEMPERATURE
@@ -164,18 +153,12 @@ class BaselineCAMRMCPATRMPREDetector:
     def _build_tool_prompt(self, tool_name: str, text: str,
                            retrieved_context: str,
                            prev_results: Dict[str, Dict],
-                           tool_dag: List[Dict],
-                           is_zh: bool) -> str:
+                           tool_dag: List[Dict]) -> str:
         tool_def = TOOL_DEFINITIONS.get(tool_name, TOOL_DEFINITIONS["semantic_dissector"])
 
-        if is_zh:
-            t_name = tool_def["name_zh"]
-            t_desc = tool_def["desc_zh"]
-            template = TOOL_PROMPT_ZH
-        else:
-            t_name = tool_def["name_en"]
-            t_desc = tool_def["desc_en"]
-            template = TOOL_PROMPT_EN
+        t_name = tool_def["name_en"]
+        t_desc = tool_def["desc_en"]
+        template = TOOL_PROMPT_EN
 
         dep_context = ""
         deps = []
@@ -193,29 +176,16 @@ class BaselineCAMRMCPATRMPREDetector:
             for dep in deps:
                 if dep in prev_results:
                     r = prev_results[dep]
-                    if is_zh:
-                        dep_lines.append(
-                            f"[前序工具 - {TOOL_DEFINITIONS.get(dep, {}).get('name_zh', dep)}] "
-                            f"的分析结果：\n{r['reasoning_trace'][:300]}\n"
-                            f"（置信度: {r['confidence_score']:.2f}, 判断: {r['prediction']}）"
-                        )
-                    else:
-                        dep_lines.append(
-                            f"[Prerequisite tool - {TOOL_DEFINITIONS.get(dep, {}).get('name_en', dep)}] "
-                            f"analysis result:\n{r['reasoning_trace'][:300]}\n"
-                            f"(Confidence: {r['confidence_score']:.2f}, Judgment: {r['prediction']})"
-                        )
+                    dep_lines.append(
+                        f"[Prerequisite tool - {TOOL_DEFINITIONS.get(dep, {}).get('name_en', dep)}] "
+                        f"analysis result:\n{r['reasoning_trace'][:300]}\n"
+                        f"(Confidence: {r['confidence_score']:.2f}, Judgment: {r['prediction']})"
+                    )
             if dep_lines:
-                if is_zh:
-                    dep_context = "前序工具的分析结果（供你参考）：\n" + "\n\n".join(dep_lines)
-                else:
-                    dep_context = "Analysis results from prerequisite tools (for your reference):\n" + "\n\n".join(dep_lines)
+                dep_context = "Analysis results from prerequisite tools (for your reference):\n" + "\n\n".join(dep_lines)
 
         if not dep_context:
-            if is_zh:
-                dep_context = "（无前序工具依赖）"
-            else:
-                dep_context = "(No prerequisite tool dependencies)"
+            dep_context = "(No prerequisite tool dependencies)"
 
         return template.format(
             tool_name=t_name,
@@ -227,31 +197,19 @@ class BaselineCAMRMCPATRMPREDetector:
 
     def _build_mpre_prompt(self, text: str, context_str: str,
                            evidence_str: str, num_tools: int,
-                           weighted_vote: dict, is_zh: bool) -> str:
-        """构建带加权投票信号的 MPRE prompt"""
-        template = MPRE_PROMPT_ZH if is_zh else MPRE_PROMPT_EN
+                           weighted_vote: dict) -> str:
+        """Build MPRE prompt with weighted voting signal"""
+        template = MPRE_PROMPT_EN
 
-        # 注入加权投票信号
-        if is_zh:
-            vote_signal = (
-                f"\n工具置信度加权投票结果：\n"
-                f"  虚假加权得分: {weighted_vote['fake_score']:.2f}, "
-                f"真实加权得分: {weighted_vote['real_score']:.2f}\n"
-                f"  多数票方向: {weighted_vote['majority']}, "
-                f"优势幅度: {weighted_vote['margin']:.1%}\n"
-                f"  注意：此投票结果仅供参考，你应基于具体证据做出独立判断。"
-                f"但如果你的判断与多数票方向不同，请确保有充分的理由。"
-            )
-        else:
-            vote_signal = (
-                f"\nConfidence-weighted tool voting result:\n"
-                f"  Fake weighted score: {weighted_vote['fake_score']:.2f}, "
-                f"Real weighted score: {weighted_vote['real_score']:.2f}\n"
-                f"  Majority direction: {weighted_vote['majority']}, "
-                f"Margin: {weighted_vote['margin']:.1%}\n"
-                f"  Note: This vote is for reference only. Make your independent judgment based on evidence. "
-                f"However, if your judgment differs from the majority, ensure you have strong justification."
-            )
+        vote_signal = (
+            f"\nConfidence-weighted tool voting result:\n"
+            f"  Fake weighted score: {weighted_vote['fake_score']:.2f}, "
+            f"Real weighted score: {weighted_vote['real_score']:.2f}\n"
+            f"  Majority direction: {weighted_vote['majority']}, "
+            f"Margin: {weighted_vote['margin']:.1%}\n"
+            f"  Note: This vote is for reference only. Make your independent judgment based on evidence. "
+            f"However, if your judgment differs from the majority, ensure you have strong justification."
+        )
 
         base_prompt = template.format(
             text=text,
@@ -260,17 +218,15 @@ class BaselineCAMRMCPATRMPREDetector:
             num_tools=num_tools,
         )
 
-        # 在 prompt 末尾的输出格式指令之前插入投票信号
         return base_prompt + "\n" + vote_signal
 
     async def run_dataset(self, dataset_type: str, retriever: CAMRRetriever) -> Dict[str, Any]:
         config = DATASET_CONFIGS[dataset_type]
         self.batch_size = config.get("batch_size", BATCH_SIZE)
         self.max_concurrency = config.get("max_concurrency", MAX_CONCURRENCY)
-        is_zh = dataset_type in ZH_DATASETS
 
         print(f"\n{'='*60}")
-        print(f"Exp4: +MPRE (K={self.top_k}) — 数据集: {dataset_type}")
+        print(f"Exp4: +MPRE (K={self.top_k}) — Dataset: {dataset_type}")
         print(f"{'='*60}")
 
         start_time = time.time()
@@ -320,13 +276,13 @@ class BaselineCAMRMCPATRMPREDetector:
 
         f_write = open(result_path, "a" if existing_results else "w", encoding="utf-8")
 
-        planning_template = MCP_PLANNING_PROMPT_ZH if is_zh else MCP_PLANNING_PROMPT_EN
+        planning_template = MCP_PLANNING_PROMPT_EN
 
         async def process_item(session, idx, text, image_filename, label, retrieved):
             if idx in processed_indices:
                 return None
 
-            context_str = retriever.format_context(retrieved, is_zh=is_zh)
+            context_str = retriever.format_context(retrieved)
 
             image_path = None
             if image_filename:
@@ -363,7 +319,7 @@ class BaselineCAMRMCPATRMPREDetector:
             for tool_name in tool_sequence:
                 tool_prompt = self._build_tool_prompt(
                     tool_name, text, context_str,
-                    tool_results, tool_dag, is_zh
+                    tool_results, tool_dag
                 )
                 async with semaphore:
                     tool_response = await self._call_llm(session, tool_prompt, image_path)
@@ -408,16 +364,16 @@ class BaselineCAMRMCPATRMPREDetector:
             else:
                 # 存在冲突或低置信度 → 调用 MPRE 仲裁
                 evidence_str, included, filtered = format_tool_evidence_filtered(
-                    tool_results, is_zh=is_zh, min_confidence=CONFIDENCE_FILTER_THRESHOLD
+                    tool_results, min_confidence=CONFIDENCE_FILTER_THRESHOLD
                 )
                 if included == 0:
                     evidence_str, included, filtered = format_tool_evidence_filtered(
-                        tool_results, is_zh=is_zh, min_confidence=0.0
+                        tool_results, min_confidence=0.0
                     )
 
                 mpre_prompt = self._build_mpre_prompt(
                     text, context_str, evidence_str, included,
-                    weighted_vote, is_zh
+                    weighted_vote
                 )
                 async with semaphore:
                     mpre_response = await self._call_llm(session, mpre_prompt, image_path)

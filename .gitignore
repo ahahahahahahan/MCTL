@@ -3,3 +3,4 @@ nohup.out
 results/
 __pycache__/
 *.pyc
+cache/

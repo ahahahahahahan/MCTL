@@ -17,13 +17,11 @@ from config import (
     TEMPERATURE, MAX_TOKENS,
     BATCH_SIZE, MAX_CONCURRENCY, BATCH_DELAY, REQUEST_DELAY,
     DATASET_CONFIGS, API_TIMEOUT,
-    MCP_PLANNING_PROMPT_EN, MCP_PLANNING_PROMPT_ZH,
-    MCP_ANALYSIS_PROMPT_EN, MCP_ANALYSIS_PROMPT_ZH,
+    MCP_PLANNING_PROMPT_EN,
+    MCP_ANALYSIS_PROMPT_EN,
 )
 from models.baseline_CAMR import CAMRRetriever
 from utils import preprocess_data, fetch_api, extract_answer, normalize_prediction, calculate_metrics
-
-ZH_DATASETS = {"weibo", "weibo21"}
 
 
 def parse_planning_output(response: str) -> Dict[str, Any]:
@@ -179,7 +177,6 @@ class BaselineCAMRMCPDetector:
         config = DATASET_CONFIGS[dataset_type]
         self.batch_size = config.get("batch_size", BATCH_SIZE)
         self.max_concurrency = config.get("max_concurrency", MAX_CONCURRENCY)
-        is_zh = dataset_type in ZH_DATASETS
 
         print(f"\n{'='*60}")
         print(f"Exp2: Baseline + CAMR + MCP (K={self.top_k}) — 数据集: {dataset_type}")
@@ -233,14 +230,14 @@ class BaselineCAMRMCPDetector:
         f_write = open(result_path, "a" if existing_results else "w", encoding="utf-8")
 
         # 选择 prompt 模板
-        planning_template = MCP_PLANNING_PROMPT_ZH if is_zh else MCP_PLANNING_PROMPT_EN
-        analysis_template = MCP_ANALYSIS_PROMPT_ZH if is_zh else MCP_ANALYSIS_PROMPT_EN
+        planning_template = MCP_PLANNING_PROMPT_EN
+        analysis_template = MCP_ANALYSIS_PROMPT_EN
 
         async def process_item(session, idx, text, image_filename, label, retrieved):
             if idx in processed_indices:
                 return None
 
-            context_str = retriever.format_context(retrieved, is_zh=is_zh)
+            context_str = retriever.format_context(retrieved)
 
             image_path = None
             if image_filename:

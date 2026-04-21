@@ -1,5 +1,5 @@
 """
-API 调用工具函数
+API call utility functions
 """
 import asyncio
 import aiohttp
@@ -8,28 +8,27 @@ import os
 from typing import Optional
 from config import API_KEY, API_URL, API_MODEL, API_TIMEOUT, TEMPERATURE, MAX_TOKENS, REQUEST_DELAY
 
-# 图片编码缓存，避免重复编码同一张图片
+# Image encoding cache to avoid re-encoding the same image
 _image_cache = {}
 
-# 429 重试配置
+# 429 retry configuration
 MAX_RETRIES = 5
-RETRY_BASE_DELAY = 3  # 首次重试等待秒数，指数退避
+RETRY_BASE_DELAY = 3  # Initial retry wait in seconds, exponential backoff
 
 
 def _encode_image(image_path: str) -> str:
     """
-    将图片编码为base64（带缓存）
+    Encode an image to base64 (with cache).
 
     Args:
-        image_path: 图片文件路径
+        image_path: Path to image file
 
     Returns:
-        base64 编码的图片数据
+        Base64-encoded image data
     """
     if not image_path or not os.path.exists(image_path):
         return ""
 
-    # 使用缓存避免重复编码
     if image_path in _image_cache:
         return _image_cache[image_path]
 
@@ -39,7 +38,7 @@ def _encode_image(image_path: str) -> str:
             _image_cache[image_path] = encoded
             return encoded
     except Exception as e:
-        print(f"图片编码失败 {image_path}: {e}")
+        print(f"Image encoding failed {image_path}: {e}")
         return ""
 
 async def fetch_api(
@@ -52,14 +51,14 @@ async def fetch_api(
     request_delay: float = REQUEST_DELAY
 ) -> str:
     """
-    异步调用 API（支持文本和图片，OpenAI 兼容格式，含 429 重试）
+    Async API call (supports text and image, OpenAI-compatible format, with 429 retry)
     """
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
     }
 
-    # 构建消息内容
+    # Build message content
     if image_path and os.path.exists(image_path):
         image_data = _encode_image(image_path)
         if not image_data:
@@ -99,25 +98,25 @@ async def fetch_api(
                     if 'choices' in result and len(result['choices']) > 0:
                         return result['choices'][0]['message']['content'].strip()
                     else:
-                        return f"API响应格式异常: {str(result)[:200]}"
+                        return f"Unexpected API response format: {str(result)[:200]}"
                 elif response.status == 429:
                     if attempt < MAX_RETRIES:
                         wait = RETRY_BASE_DELAY * (2 ** attempt)
                         await asyncio.sleep(wait)
                         continue
-                    return f"API请求频率过高(429)，已重试{MAX_RETRIES}次仍失败"
+                    return f"API rate limited (429), failed after {MAX_RETRIES} retries"
                 elif response.status == 401:
-                    return f"API认证失败(401)，请检查API Key"
+                    return f"API authentication failed (401), please check API Key"
                 else:
                     error_text = await response.text()
-                    return f"API请求失败(状态码{response.status}): {error_text[:200]}"
+                    return f"API request failed (status {response.status}): {error_text[:200]}"
         except asyncio.TimeoutError:
             if attempt < MAX_RETRIES:
                 wait = RETRY_BASE_DELAY * (2 ** attempt)
                 await asyncio.sleep(wait)
                 continue
-            return f"API调用超时(>{timeout}秒)，已重试{MAX_RETRIES}次"
+            return f"API call timed out (>{timeout}s), failed after {MAX_RETRIES} retries"
         except Exception as e:
-            return f"API调用异常: {str(e)[:200]}"
+            return f"API call exception: {str(e)[:200]}"
 
-    return "API调用失败: 超出最大重试次数"
+    return "API call failed: exceeded max retries"

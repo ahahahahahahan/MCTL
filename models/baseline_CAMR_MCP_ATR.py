@@ -17,13 +17,11 @@ from config import (
     TEMPERATURE, MAX_TOKENS,
     BATCH_SIZE, MAX_CONCURRENCY, BATCH_DELAY, REQUEST_DELAY,
     DATASET_CONFIGS, API_TIMEOUT,
-    MCP_PLANNING_PROMPT_EN, MCP_PLANNING_PROMPT_ZH,
+    MCP_PLANNING_PROMPT_EN,
 )
 from models.baseline_CAMR import CAMRRetriever
 from models.baseline_CAMR_MCP import parse_planning_output, get_dag_execution_order
 from utils import preprocess_data, fetch_api, extract_answer, normalize_prediction, calculate_metrics
-
-ZH_DATASETS = {"weibo", "weibo21"}
 
 # ============================================================
 # 8 个专门化 LLM 工具定义
@@ -31,51 +29,35 @@ ZH_DATASETS = {"weibo", "weibo21"}
 TOOL_DEFINITIONS = {
     "semantic_dissector": {
         "name_en": "Semantic Dissector",
-        "name_zh": "语义解构器",
         "desc_en": "Analyze the literal and implied meaning of the text. Identify double meanings, metaphors, hidden implications, and whether the surface meaning differs from the actual intent.",
-        "desc_zh": "分析文本的字面含义和隐含含义。识别双关语、隐喻、隐藏暗示，以及表面含义是否与实际意图不同。",
     },
     "rhetorical_scanner": {
         "name_en": "Rhetorical Scanner",
-        "name_zh": "修辞探测器",
         "desc_en": "Identify rhetorical manipulation techniques: irony, exaggeration, clickbait headlines, propaganda tactics, sensationalist language (e.g., '!!!' or 'BREAKING'), and persuasion devices.",
-        "desc_zh": "识别修辞操纵手法：反讽、夸张、标题党、宣传策略、煽动性语言（如'!!!'或'震惊'），以及说服手段。",
     },
     "knowledge_grounding": {
         "name_en": "Knowledge Grounding",
-        "name_zh": "知识锚定器",
         "desc_en": "Verify factual claims against the retrieved context and known facts. Check if specific claims (names, dates, events, statistics) are consistent with the retrieved articles and general knowledge.",
-        "desc_zh": "根据检索上下文和已知事实核查事实性声明。检查具体声明（人名、日期、事件、统计数据）是否与检索到的文章和常识一致。",
     },
     "expectation_deviator": {
         "name_en": "Expectation Deviator",
-        "name_zh": "期望偏移器",
         "desc_en": "Assess the deviation between what the image/headline leads readers to expect and what the actual content delivers. Identify bait-and-switch tactics and misleading framing.",
-        "desc_zh": "评估图片/标题引导读者产生的期望与实际内容之间的偏差。识别诱导点击策略和误导性框架。",
     },
     "cross_modal_aligner": {
         "name_en": "Cross-Modal Aligner",
-        "name_zh": "跨模态对齐器",
         "desc_en": "Evaluate the semantic consistency between the text and the image. Determine if the image genuinely illustrates the reported event or is unrelated/manipulated/out-of-context.",
-        "desc_zh": "评估文本和图片之间的语义一致性。判断图片是否真正展示了所报道的事件，还是无关/被篡改/脱离原始上下文的。",
     },
     "inconsistency_amplifier": {
         "name_en": "Inconsistency Amplifier",
-        "name_zh": "不一致放大器",
         "desc_en": "Systematically quantify contradictions across text, image, and retrieved context. Identify internal contradictions within the article and external contradictions with verified information.",
-        "desc_zh": "系统性地量化文本、图片和检索上下文之间的矛盾。识别文章内部矛盾以及与已验证信息的外部矛盾。",
     },
     "emotional_manipulator": {
         "name_en": "Emotional Manipulator Detector",
-        "name_zh": "情感操纵检测器",
         "desc_en": "Detect emotional manipulation elements: fear-inducing language, outrage triggers, appeal to tribal identity, urgency fabrication, and emotional framing designed to bypass rational evaluation.",
-        "desc_zh": "检测情感操纵元素：恐惧诱导语言、愤怒触发器、群体认同诉求、紧迫感制造，以及旨在绕过理性评估的情感框架。",
     },
     "evidence_comparator": {
         "name_en": "Evidence Comparator",
-        "name_zh": "证据对比器",
         "desc_en": "Compare the target news with retrieved similar samples. Analyze the label distribution of similar articles, identify pattern matches with known fake/real news, and assess source reliability patterns.",
-        "desc_zh": "将目标新闻与检索到的相似样本进行比较。分析相似文章的标签分布，识别与已知虚假/真实新闻的模式匹配，评估来源可靠性模式。",
     },
 }
 
@@ -116,25 +98,6 @@ Your output must strictly follow this format:
 Confidence: [A number between 0.0 and 1.0 indicating how confident you are in your assessment. Higher means more certain about whether this is real or fake.]
 Judgment: [real/fake]"'''
 
-TOOL_PROMPT_ZH = '''你正在扮演"{tool_name}"——一个用于虚假新闻检测的专门分析工具。
-
-你的具体任务：{tool_desc}
-
-从已验证数据库中检索到的相似样本：
-{retrieved_context}
-
-{dependency_context}
-
-待分析的目标新闻：
-"{text}"
-
-请仅针对你负责的分析维度进行专门分析，做到深入但聚焦。
-
-你的输出必须严格遵循以下格式：
-"分析：[你针对该维度的详细分析]
-置信度：[0.0到1.0之间的数字，表示你对判断的确信程度。越高表示越确定新闻是真实还是虚假。]
-判断：[真实/虚假]"'''
-
 
 def parse_tool_output(response: str) -> Dict[str, Any]:
     """解析工具输出，提取 reasoning_trace、confidence_score 和 prediction"""
@@ -147,7 +110,6 @@ def parse_tool_output(response: str) -> Dict[str, Any]:
     # 提取置信度
     conf_patterns = [
         r'[Cc]onfidence:\s*([\d.]+)',
-        r'置信度[：:]\s*([\d.]+)',
     ]
     for pattern in conf_patterns:
         match = re.search(pattern, response)
@@ -163,7 +125,6 @@ def parse_tool_output(response: str) -> Dict[str, Any]:
     # 提取判断
     judge_patterns = [
         r'[Jj]udgment:\s*\[?\s*(real|fake)\s*\]?',
-        r'判断[：:]\s*\[?\s*(真实|虚假)\s*\]?',
     ]
     for pattern in judge_patterns:
         match = re.search(pattern, response)
@@ -242,29 +203,21 @@ class BaselineCAMRMCPATRDetector:
     def _build_tool_prompt(self, tool_name: str, text: str,
                            retrieved_context: str,
                            prev_results: Dict[str, Dict],
-                           tool_dag: List[Dict],
-                           is_zh: bool) -> str:
-        """为指定工具构建专门化 prompt"""
+                           tool_dag: List[Dict]) -> str:
+        """Build specialized prompt for a given tool"""
         tool_def = TOOL_DEFINITIONS.get(tool_name, TOOL_DEFINITIONS["semantic_dissector"])
 
-        if is_zh:
-            t_name = tool_def["name_zh"]
-            t_desc = tool_def["desc_zh"]
-            template = TOOL_PROMPT_ZH
-        else:
-            t_name = tool_def["name_en"]
-            t_desc = tool_def["desc_en"]
-            template = TOOL_PROMPT_EN
+        t_name = tool_def["name_en"]
+        t_desc = tool_def["desc_en"]
+        template = TOOL_PROMPT_EN
 
-        # 构建依赖上下文（前序工具的分析结果）
+        # Build dependency context (analysis results from prerequisite tools)
         dep_context = ""
-        # 找到当前工具在 DAG 中的依赖
         deps = []
         for node in tool_dag:
             if node.get("tool") == tool_name:
                 deps = node.get("deps", [])
                 break
-            # 也检查映射后的名称
             mapped = DIMENSION_TO_TOOL.get(node.get("tool", ""), "")
             if mapped == tool_name:
                 deps = [DIMENSION_TO_TOOL.get(d, d) for d in node.get("deps", [])]
@@ -275,29 +228,16 @@ class BaselineCAMRMCPATRDetector:
             for dep in deps:
                 if dep in prev_results:
                     r = prev_results[dep]
-                    if is_zh:
-                        dep_lines.append(
-                            f"[前序工具 - {TOOL_DEFINITIONS.get(dep, {}).get('name_zh', dep)}] "
-                            f"的分析结果：\n{r['reasoning_trace'][:300]}\n"
-                            f"（置信度: {r['confidence_score']:.2f}, 判断: {r['prediction']}）"
-                        )
-                    else:
-                        dep_lines.append(
-                            f"[Prerequisite tool - {TOOL_DEFINITIONS.get(dep, {}).get('name_en', dep)}] "
-                            f"analysis result:\n{r['reasoning_trace'][:300]}\n"
-                            f"(Confidence: {r['confidence_score']:.2f}, Judgment: {r['prediction']})"
-                        )
+                    dep_lines.append(
+                        f"[Prerequisite tool - {TOOL_DEFINITIONS.get(dep, {}).get('name_en', dep)}] "
+                        f"analysis result:\n{r['reasoning_trace'][:300]}\n"
+                        f"(Confidence: {r['confidence_score']:.2f}, Judgment: {r['prediction']})"
+                    )
             if dep_lines:
-                if is_zh:
-                    dep_context = "前序工具的分析结果（供你参考）：\n" + "\n\n".join(dep_lines)
-                else:
-                    dep_context = "Analysis results from prerequisite tools (for your reference):\n" + "\n\n".join(dep_lines)
+                dep_context = "Analysis results from prerequisite tools (for your reference):\n" + "\n\n".join(dep_lines)
 
         if not dep_context:
-            if is_zh:
-                dep_context = "（无前序工具依赖）"
-            else:
-                dep_context = "(No prerequisite tool dependencies)"
+            dep_context = "(No prerequisite tool dependencies)"
 
         return template.format(
             tool_name=t_name,
@@ -312,7 +252,6 @@ class BaselineCAMRMCPATRDetector:
         config = DATASET_CONFIGS[dataset_type]
         self.batch_size = config.get("batch_size", BATCH_SIZE)
         self.max_concurrency = config.get("max_concurrency", MAX_CONCURRENCY)
-        is_zh = dataset_type in ZH_DATASETS
 
         print(f"\n{'='*60}")
         print(f"Exp3: Baseline + CAMR + MCP + ATR (K={self.top_k}) — 数据集: {dataset_type}")
@@ -365,13 +304,13 @@ class BaselineCAMRMCPATRDetector:
 
         f_write = open(result_path, "a" if existing_results else "w", encoding="utf-8")
 
-        planning_template = MCP_PLANNING_PROMPT_ZH if is_zh else MCP_PLANNING_PROMPT_EN
+        planning_template = MCP_PLANNING_PROMPT_EN
 
         async def process_item(session, idx, text, image_filename, label, retrieved):
             if idx in processed_indices:
                 return None
 
-            context_str = retriever.format_context(retrieved, is_zh=is_zh)
+            context_str = retriever.format_context(retrieved)
 
             image_path = None
             if image_filename:
@@ -410,7 +349,7 @@ class BaselineCAMRMCPATRDetector:
             for tool_name in tool_sequence:
                 tool_prompt = self._build_tool_prompt(
                     tool_name, text, context_str,
-                    tool_results, tool_dag, is_zh
+                    tool_results, tool_dag
                 )
                 async with semaphore:
                     tool_response = await self._call_llm(session, tool_prompt, image_path)

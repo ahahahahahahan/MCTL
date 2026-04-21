@@ -1,5 +1,5 @@
 """
-评估指标计算工具函数
+Evaluation metrics utility functions
 """
 from typing import List, Dict
 from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
@@ -7,14 +7,14 @@ from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_sc
 
 def calculate_metrics(true_labels: List[int], pred_labels: List[int]) -> Dict[str, float]:
     """
-    计算评估指标
+    Calculate evaluation metrics.
 
     Args:
-        true_labels: 真实标签列表 (0=真实, 1=虚假)
-        pred_labels: 预测标签列表 (0=真实, 1=虚假)
+        true_labels: Ground truth label list (0=real, 1=fake)
+        pred_labels: Predicted label list (0=real, 1=fake)
 
     Returns:
-        包含各种评估指标的字典
+        Dictionary containing evaluation metrics
     """
     if len(true_labels) == 0 or len(pred_labels) == 0:
         return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0, "macro_f1": 0.0}
